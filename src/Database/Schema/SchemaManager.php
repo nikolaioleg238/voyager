@@ -237,6 +237,17 @@ abstract class SchemaManager
             $columnDetails = static::getColumnDetails($tableName, $column);
             $indexes = static::getColumnIndexes($tableName, $column);
 
+            // Normalize index keys so we can safely access numeric offsets (0,1)
+            if ($indexes instanceof \Illuminate\Support\Collection) {
+                $indexes = $indexes->values()->all();
+            } elseif (is_array($indexes)) {
+                $indexes = array_values($indexes);
+            } else {
+                // Fallback: cast to array and reindex
+                $indexes = array_values((array) $indexes);
+            }
+
+            // If there is a second index (some DBs return multiple entries), keep only that one
             if (!empty($indexes) && isset($indexes[1])) {
                 $indexes = [$indexes[1]];
             }
@@ -245,9 +256,9 @@ abstract class SchemaManager
                 'field' => $column,
                 'type' => $columnDetails['type'],
                 'null' => $columnDetails['nullable'],
-                'key' => !empty($indexes) ? substr($indexes[0]['type'], 0, 3) : null,
+                'key' => !empty($indexes) && isset($indexes[0]['type']) ? substr($indexes[0]['type'], 0, 3) : null,
                 'default' => $columnDetails['default'],
-                'extra' => $columnDetails['auto_increment'] ? 'auto_increment' : '',
+                'extra' => !empty($columnDetails['auto_increment']) ? 'auto_increment' : '',
                 'indexes' => $indexes,
             ];
         });
@@ -396,19 +407,96 @@ abstract class SchemaManager
 
     public static function createTable($table)
     {
+        // Accept a Blueprint (Laravel schema builder) or a Doctrine Table (TCG\Voyager Table extends Doctrine Table)
         if ($table instanceof Blueprint) {
             Schema::create($table->getTable(), function (Blueprint $blueprint) use ($table) {
                 foreach ($table->getColumns() as $column) {
                     $blueprint->addColumn(
                         $column->getType()->getName(),
                         $column->getName(),
-                        $column->toArray()
+                        // If these are Blueprint column objects they provide a toArray method
+                        // which contains the appropriate parameters for addColumn
+                        method_exists($column, 'toArray') ? $column->toArray() : []
                     );
                 }
             });
-        } else {
-            throw new \InvalidArgumentException('Table must be an instance of Blueprint');
+
+            return;
         }
+
+        // If an array or JSON string is provided, try to coerce to our Table representation
+        if (is_array($table) || is_string($table)) {
+            $table = Table::make($table);
+        }
+
+        // Handle Doctrine Table instances (including TCG\Voyager\Database\Schema\Table)
+        if ($table instanceof \Doctrine\DBAL\Schema\Table) {
+            $tableName = method_exists($table, 'getName') ? $table->getName() : null;
+            if (empty($tableName)) {
+                throw new \InvalidArgumentException('Unable to determine table name from Doctrine Table instance');
+            }
+
+            Schema::create($tableName, function (Blueprint $blueprint) use ($table) {
+                foreach ($table->getColumns() as $column) {
+                    // Convert Doctrine Column to an options array acceptable by Blueprint->addColumn
+                    // Use our Column::toArray helper to produce a structured array
+                    try {
+                        $colArr = Column::toArray($column);
+                    } catch (\Throwable $_) {
+                        // Fallback minimal shape
+                        $colArr = [
+                            'name' => $column->getName(),
+                            'length' => $column->getLength(),
+                            'precision' => $column->getPrecision(),
+                            'scale' => $column->getScale(),
+                            'unsigned' => method_exists($column, 'getUnsigned') ? $column->getUnsigned() : false,
+                            'notnull' => $column->getNotnull(),
+                            'default' => $column->getDefault(),
+                            'autoincrement' => $column->getAutoincrement(),
+                        ];
+                    }
+
+                    // Remove keys that are not valid Blueprint column options
+                    foreach (['name', 'oldName', 'type', 'null', 'extra', 'composite'] as $k) {
+                        if (array_key_exists($k, $colArr)) {
+                            unset($colArr[$k]);
+                        }
+                    }
+
+                    // Convert Doctrine-style 'notnull' to Blueprint's 'nullable' flag
+                    if (array_key_exists('notnull', $colArr)) {
+                        $colArr['nullable'] = !((bool) $colArr['notnull']);
+                        unset($colArr['notnull']);
+                    }
+
+                    // Blueprint expects 'nullable' => true/false, and will omit options with null values.
+                    // Remove keys that are null or empty strings to avoid SQL like `varchar()`.
+                    foreach ($colArr as $k => $v) {
+                        if ($v === null || $v === '') {
+                            unset($colArr[$k]);
+                        }
+                    }
+
+                    // Ensure 'length' is an integer when present; if not, remove it so Blueprint uses defaults
+                    if (isset($colArr['length'])) {
+                        if (!is_numeric($colArr['length']) || (int) $colArr['length'] <= 0) {
+                            unset($colArr['length']);
+                        } else {
+                            $colArr['length'] = (int) $colArr['length'];
+                        }
+                    }
+                    $blueprint->addColumn(
+                        $column->getType()->getName(),
+                        $column->getName(),
+                        $colArr
+                    );
+                }
+            });
+
+            return;
+        }
+
+        throw new \InvalidArgumentException('Table must be an instance of Blueprint or a Doctrine\DBAL\Schema\Table (TCG\\Voyager Table)');
     }
 
     protected static function getColumnDetails($table, $column)
@@ -458,7 +546,11 @@ abstract class SchemaManager
              'nullable' => $columnInfo['nullable'] ?? false,
              'default' => $columnInfo['default'] ?? null,
              'auto_increment' => ($columnInfo['auto_increment'] ?? false),
-             'length' => $computedLength ?? ($columnInfo['precision'] ?? null),
+             // Keep length only when the database/schema builder explicitly provides it.
+             // Do NOT use precision as a fallback for length; precision is a different concept
+             // (numeric precision) and previously caused mediumint/other numeric types to show
+             // a length of 10 in the UI when none was set. Leave it null when not specified.
+             'length' => $computedLength ?? null,
              'precision' => $columnInfo['precision'] ?? null,
              'scale' => $columnInfo['scale'] ?? null,
              'unsigned' => $columnInfo['unsigned'] ?? false,

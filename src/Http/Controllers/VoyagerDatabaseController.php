@@ -82,19 +82,45 @@ class VoyagerDatabaseController extends Controller
             $conn = 'database.connections.'.config('database.default');
             Type::registerCustomPlatformTypes();
 
-            $table = $request->table;
-            if (!is_array($request->table)) {
-                $table = json_decode($request->table, true);
+            // Get the raw payload (may be JSON string or array)
+            $rawTable = $request->input('table');
+
+            // Decode JSON when necessary and validate
+            if (is_string($rawTable)) {
+                $decoded = json_decode($rawTable, true);
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    throw new \InvalidArgumentException('Invalid JSON payload for table: '.json_last_error_msg());
+                }
+                $tableArr = $decoded;
+            } elseif (is_array($rawTable)) {
+                $tableArr = $rawTable;
+            } else {
+                throw new \InvalidArgumentException('Missing or invalid table payload');
             }
-            $table['options']['collate'] = config($conn.'.collation', 'utf8mb4_unicode_ci');
-            $table['options']['charset'] = config($conn.'.charset', 'utf8mb4');
-            $table = Table::make($table);
-            SchemaManager::createTable($table);
+
+            // Ensure options array exists
+            if (!isset($tableArr['options']) || !is_array($tableArr['options'])) {
+                $tableArr['options'] = [];
+            }
+
+            $tableArr['options']['collate'] = $tableArr['options']['collate'] ?? config($conn.'.collation', 'utf8mb4_unicode_ci');
+            $tableArr['options']['charset'] = $tableArr['options']['charset'] ?? config($conn.'.charset', 'utf8mb4');
+
+            // Validate minimal required keys
+            if (empty($tableArr['name']) || empty($tableArr['columns']) || !is_array($tableArr['columns'])) {
+                throw new \InvalidArgumentException('Table payload must include a name and an array of columns');
+            }
+
+            // Construct a TCG\Voyager Table instance (this will validate identifiers)
+            $tableObj = Table::make($tableArr);
+
+            // Delegate creation to SchemaManager which accepts Doctrine Table instances
+            SchemaManager::createTable($tableObj);
 
             if (isset($request->create_model) && $request->create_model == 'on') {
                 $modelNamespace = config('voyager.models.namespace', app()->getNamespace());
                 $params = [
-                    'name' => $modelNamespace.Str::studly(Str::singular($table->name)),
+                    'name' => $modelNamespace.Str::studly(Str::singular($tableObj->name)),
                 ];
 
                 // if (in_array('deleted_at', $request->input('field.*'))) {
@@ -108,17 +134,24 @@ class VoyagerDatabaseController extends Controller
                 Artisan::call('voyager:make:model', $params);
             } elseif (isset($request->create_migration) && $request->create_migration == 'on') {
                 Artisan::call('make:migration', [
-                    'name'    => 'create_'.$table->name.'_table',
-                    '--table' => $table->name,
+                    'name'    => 'create_'.$tableObj->name.'_table',
+                    '--table' => $tableObj->name,
                 ]);
             }
 
-            event(new TableAdded($table));
+            event(new TableAdded($tableObj));
 
             return redirect()
                ->route('voyager.database.index')
-               ->with($this->alertSuccess(__('voyager::database.success_create_table', ['table' => $table->name])));
+               ->with($this->alertSuccess(__('voyager::database.success_create_table', ['table' => $tableObj->name])));
         } catch (Exception $e) {
+            // Log the exception for debugging and return a helpful message to the user
+            Log::error('VoyagerDatabaseController::store failed creating table', [
+                'exception' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+                'payload' => $request->input('table'),
+            ]);
+
             return back()->with($this->alertException($e))->withInput();
         }
     }
@@ -278,7 +311,12 @@ class VoyagerDatabaseController extends Controller
             }
         }
 
-        return response()->json(collect(SchemaManager::describeTable($table))->merge($additional_attributes));
+        // Ensure the described table collection is keyed by column name so merging
+        // with additional attributes (an associative array) doesn't create numeric
+        // key conflicts which can trigger "Undefined array key 0" notices.
+        $described = collect(SchemaManager::describeTable($table))->keyBy('field')->merge($additional_attributes);
+
+        return response()->json($described);
     }
 
     /**

@@ -52,6 +52,7 @@ abstract class Column
             $aliasMap = [
                 'int' => 'integer',
                 'integer' => 'integer',
+                'mediumint' => 'integer',
                 'bigint' => 'bigint',
                 'smallint' => 'smallint',
                 'tinyint' => 'smallint',
@@ -180,10 +181,15 @@ abstract class Column
 //        } else {
 //            $columnArr['length'] = $colLength;
 //        }
+        // Keep length exactly as Doctrine reports it (may be null). Do NOT derive length
+        // from precision: precision is a different concept and was causing UI to show
+        // values like 10 for mediumint as a "length". Leave length null when not set.
         $columnArr['length'] = $colLength;
 
         $columnArr['precision'] = $colPrecision;
         $columnArr['scale'] = $column->getScale();
+
+
         $columnArr['unsigned'] = (bool) $column->getUnsigned();
         $columnArr['fixed'] = (bool) method_exists($column, 'getFixed') ? (bool) $column->getFixed() : false;
         $columnArr['notnull'] = (bool) $column->getNotnull();
