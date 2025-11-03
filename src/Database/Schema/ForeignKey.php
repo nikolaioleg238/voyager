@@ -8,15 +8,37 @@ abstract class ForeignKey
 {
     public static function make(array $foreignKey)
     {
-        // Set the local table
+        // Set the local table if provided
         $localTable = null;
-        if (isset($foreignKey['localTable'])) {
+        if (!empty($foreignKey['localTable'])) {
             $localTable = SchemaManager::getDoctrineTable($foreignKey['localTable']);
         }
 
-        $localColumns = $foreignKey['localColumns'];
-        $foreignTable = $foreignKey['foreignTable'];
-        $foreignColumns = $foreignKey['foreignColumns'];
+        // Normalize local columns (accept 'localColumns', 'columns', 'local_columns')
+        $localColumns = $foreignKey['localColumns'] ?? $foreignKey['columns'] ?? $foreignKey['local_columns'] ?? null;
+        if ($localColumns === null) {
+            throw new \InvalidArgumentException('Foreign key definition must contain local columns (localColumns or columns)');
+        }
+        if (!is_array($localColumns)) {
+            $localColumns = is_string($localColumns) ? explode(',', $localColumns) : (array) $localColumns;
+        }
+
+        // Normalize foreign table name (accept 'foreignTable' or 'foreign_table')
+        $foreignTable = $foreignKey['foreignTable'] ?? $foreignKey['foreign_table'] ?? null;
+        if ($foreignTable === null) {
+            throw new \InvalidArgumentException('Foreign key definition must contain foreign table (foreignTable or foreign_table)');
+        }
+
+        // Normalize foreign columns (accept 'foreignColumns' or 'foreign_columns')
+        $foreignColumns = $foreignKey['foreignColumns'] ?? $foreignKey['foreign_columns'] ?? null;
+        if ($foreignColumns === null) {
+            // default to 'id' if nothing is provided
+            $foreignColumns = ['id'];
+        }
+        if (!is_array($foreignColumns)) {
+            $foreignColumns = is_string($foreignColumns) ? explode(',', $foreignColumns) : (array) $foreignColumns;
+        }
+
         $options = $foreignKey['options'] ?? [];
 
         // Set the name

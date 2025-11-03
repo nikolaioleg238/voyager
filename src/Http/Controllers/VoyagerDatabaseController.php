@@ -17,6 +17,7 @@ use TCG\Voyager\Events\TableAdded;
 use TCG\Voyager\Events\TableDeleted;
 use TCG\Voyager\Events\TableUpdated;
 use TCG\Voyager\Facades\Voyager;
+use Illuminate\Support\Facades\Log;
 
 class VoyagerDatabaseController extends Controller
 {
@@ -51,7 +52,17 @@ class VoyagerDatabaseController extends Controller
     {
         $this->authorize('browse_database');
 
-        $db = $this->prepareDbManager('create');
+        try {
+            $db = $this->prepareDbManager('create');
+        } catch (\Throwable $e) {
+            Log::error('VoyagerDatabaseController::create prepareDbManager failed', [
+                'action' => 'create',
+                'exception' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            return back()->with($this->alertException($e));
+        }
 
         return Voyager::view('voyager::tools.database.edit-add', compact('db'));
     }
@@ -129,7 +140,18 @@ class VoyagerDatabaseController extends Controller
                 ->with($this->alertError(__('voyager::database.edit_table_not_exist')));
         }
 
-        $db = $this->prepareDbManager('update', $table);
+        try {
+            $db = $this->prepareDbManager('update', $table);
+        } catch (\Throwable $e) {
+            Log::error('VoyagerDatabaseController::edit prepareDbManager failed', [
+                'action' => 'update',
+                'table' => $table,
+                'exception' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            return back()->with($e->getMessage());
+        }
 
         return Voyager::view('voyager::tools.database.edit-add', compact('db'));
     }
@@ -165,7 +187,9 @@ class VoyagerDatabaseController extends Controller
     {
         $db = new \stdClass();
 
-        // Need to get the types first to register custom types
+         // Need to get the types first to register custom types
+        // Ensure custom platform types are registered before retrieving types
+        Type::registerCustomPlatformTypes();
         $db->types = Type::getPlatformTypes();
 
         if ($action == 'update') {

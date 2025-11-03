@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Collection;
+use TCG\Voyager\Database\Types\Type; // ensure Type is available
 
 abstract class SchemaManager
 {
@@ -47,6 +48,13 @@ abstract class SchemaManager
 
     public static function listTableDetails($tableName)
     {
+        // Ensure Doctrine/DBAL custom platform types are registered before introspection
+        try {
+            Type::registerCustomPlatformTypes();
+        } catch (\Throwable $_) {
+            // ignore failures, Column::make also registers defensively
+        }
+
         $columns = Schema::getColumnListing($tableName);
         $columnDetails = collect($columns)->mapWithKeys(function ($column) use ($tableName) {
             return [$column => static::getColumnDetails($tableName, $column)];
@@ -55,7 +63,170 @@ abstract class SchemaManager
         $indexes = static::getTableIndexes($tableName);
         $foreignKeys = static::getTableForeignKeys($tableName);
 
-        return new Table($tableName, $columnDetails->toArray(), $indexes, [], $foreignKeys, []);
+        // Build Doctrine Column instances expected by Doctrine\DBAL\Schema\Table
+        $doctrineColumns = [];
+        foreach ($columnDetails as $colName => $colArr) {
+            // Normalize to shape expected by Column::make
+            $colArr['name'] = $colName;
+
+            // Map Laravel/DB shorthand types to Doctrine types
+            $rawType = $colArr['type'];
+
+            // Determine a string representation of the raw type (handle arrays and strings)
+            if (is_array($rawType)) {
+                $typeName = $rawType['name'] ?? ($rawType['type'] ?? '');
+            } elseif (is_string($rawType)) {
+                $typeName = $rawType;
+            } else {
+                $typeName = '';
+            }
+
+            $typeName = trim((string) $typeName);
+
+            // Extract the base type token (strip length/precision and modifiers like "unsigned")
+            if ($typeName !== '') {
+                if (preg_match('/^([a-z0-9_]+)/i', $typeName, $m)) {
+                    $baseType = strtolower($m[1]);
+                } else {
+                    $baseType = strtolower($typeName);
+                }
+            } else {
+                $baseType = '';
+            }
+
+            $typeMap = [
+                'int' => 'integer',
+                'integer' => 'integer',
+                'bigint' => 'bigint',
+                'smallint' => 'smallint',
+                'tinyint' => 'smallint',
+                'bool' => 'boolean',
+                'boolean' => 'boolean',
+                'varchar' => 'string',
+                'char' => 'string',
+                'string' => 'string',
+                'text' => 'text',
+                'mediumtext' => 'text',
+                'longtext' => 'text',
+                'datetime' => 'datetime',
+                'timestamp' => 'datetime',
+                'datetimetz' => 'datetimetz',
+                'date' => 'date',
+                'time' => 'time',
+                'decimal' => 'decimal',
+                'numeric' => 'decimal',
+                'float' => 'float',
+                'double' => 'float',
+                'real' => 'float',
+                'json' => 'json',
+                'jsonb' => 'json',
+                'enum' => 'string',
+                'set' => 'string',
+                'uuid' => 'guid',
+                'guid' => 'guid',
+                'binary' => 'binary',
+                'blob' => 'blob',
+            ];
+
+            $doctrineTypeName = $typeMap[$baseType] ?? $baseType;
+
+            // Map boolean nullable to Doctrine 'notnull'
+            if (array_key_exists('nullable', $colArr)) {
+                $colArr['notnull'] = !$colArr['nullable'];
+                unset($colArr['nullable']);
+            }
+            // Normalize auto_increment key
+            if (array_key_exists('auto_increment', $colArr)) {
+                $colArr['autoincrement'] = (bool) $colArr['auto_increment'];
+                unset($colArr['auto_increment']);
+            }
+
+            // Ensure type is an array with 'name' key that Column::make expects
+            $colArr['type'] = ['name' => $doctrineTypeName];
+
+            // Create a Doctrine Column instance via our Column::make helper
+            $doctrineColumns[$colName] = Column::make($colArr, $tableName);
+        }
+
+        // Convert index arrays into Doctrine Index objects
+        $doctrineIndexes = [];
+        foreach ($indexes as $indexArr) {
+            // Ensure table is provided so Index::make can generate names if needed
+            if (!isset($indexArr['table'])) {
+                $indexArr['table'] = $tableName;
+            }
+            $indexObj = Index::make($indexArr);
+            $doctrineIndexes[$indexObj->getName()] = $indexObj;
+        }
+
+        // Convert foreign key arrays into Doctrine ForeignKeyConstraint objects
+        $doctrineForeignKeys = [];
+        foreach ($foreignKeys as $fkArr) {
+            // Normalize keys from Laravel's schema output to what ForeignKey::make expects
+            // Laravel provides: name, columns, foreign_schema, foreign_table, foreign_columns, on_update, on_delete
+            if (!is_array($fkArr)) {
+                continue; // skip malformed entry
+            }
+
+            $normalizedFk = [];
+
+            // keep original name if present
+            if (!empty($fkArr['name'])) {
+                $normalizedFk['name'] = $fkArr['name'];
+            }
+
+            // local columns
+            if (!empty($fkArr['columns'])) {
+                $normalizedFk['localColumns'] = is_array($fkArr['columns']) ? $fkArr['columns'] : explode(',', $fkArr['columns']);
+            } else {
+                // if no local columns, skip this FK
+                continue;
+            }
+
+            // foreign table
+            if (!empty($fkArr['foreign_table'])) {
+                $normalizedFk['foreignTable'] = $fkArr['foreign_table'];
+            } elseif (!empty($fkArr['foreignTable'])) {
+                $normalizedFk['foreignTable'] = $fkArr['foreignTable'];
+            } else {
+                // no foreign table, skip
+                continue;
+            }
+
+            // foreign columns
+            if (!empty($fkArr['foreign_columns'])) {
+                $normalizedFk['foreignColumns'] = is_array($fkArr['foreign_columns']) ? $fkArr['foreign_columns'] : explode(',', $fkArr['foreign_columns']);
+            } elseif (!empty($fkArr['foreignColumns'])) {
+                $normalizedFk['foreignColumns'] = is_array($fkArr['foreignColumns']) ? $fkArr['foreignColumns'] : explode(',', $fkArr['foreignColumns']);
+            } else {
+                // default to referencing primary key if missing
+                $normalizedFk['foreignColumns'] = ['id'];
+            }
+
+            // Provide localTable if available
+            $normalizedFk['localTable'] = $tableName;
+
+            // Build options from on_update/on_delete
+            $options = [];
+            if (!empty($fkArr['on_update'])) {
+                $options['onUpdate'] = $fkArr['on_update'];
+            }
+            if (!empty($fkArr['on_delete'])) {
+                $options['onDelete'] = $fkArr['on_delete'];
+            }
+            $normalizedFk['options'] = $options;
+
+            // Now create the ForeignKey object
+            try {
+                $fkObj = ForeignKey::make($normalizedFk);
+                $doctrineForeignKeys[$fkObj->getName()] = $fkObj;
+            } catch (\Throwable $e) {
+                // Skip invalid foreign key definitions rather than crashing the whole page
+                continue;
+            }
+        }
+
+        return new Table($tableName, $doctrineColumns, $doctrineIndexes, [], $doctrineForeignKeys, []);
     }
 
     public static function describeTable($tableName)
@@ -80,6 +251,142 @@ abstract class SchemaManager
                 'indexes' => $indexes,
             ];
         });
+    }
+
+    // Add alterTable to delegate to Doctrine's schema manager when available
+    public static function alterTable($tableDiff)
+    {
+        // Register custom platform types in case they haven't been registered yet
+        try {
+            Type::registerCustomPlatformTypes();
+        } catch (\Throwable $_) {
+            // ignore
+        }
+
+        $connection = Schema::getConnection();
+
+        $doctrineManager = null;
+
+        // 1) Common Laravel helper: connection exposes getDoctrineSchemaManager()
+        if (method_exists($connection, 'getDoctrineSchemaManager')) {
+            try {
+                $doctrineManager = $connection->getDoctrineSchemaManager();
+            } catch (\Throwable $_) {
+                $doctrineManager = null;
+            }
+        }
+
+        // 2) Some connections expose the underlying Doctrine connection
+        if (!$doctrineManager) {
+            try {
+                if (method_exists($connection, 'getDoctrineConnection')) {
+                    $doctrineConn = $connection->getDoctrineConnection();
+                } else {
+                    $doctrineConn = null;
+                }
+            } catch (\Throwable $_) {
+                $doctrineConn = null;
+            }
+
+            if ($doctrineConn) {
+                // DBAL 2: getSchemaManager(); DBAL 3+: createSchemaManager()
+                if (method_exists($doctrineConn, 'getSchemaManager')) {
+                    try {
+                        $doctrineManager = $doctrineConn->getSchemaManager();
+                    } catch (\Throwable $_) {
+                        $doctrineManager = null;
+                    }
+                } elseif (method_exists($doctrineConn, 'createSchemaManager')) {
+                    try {
+                        $doctrineManager = $doctrineConn->createSchemaManager();
+                    } catch (\Throwable $_) {
+                        $doctrineManager = null;
+                    }
+                } elseif (method_exists($doctrineConn, 'getDoctrineSchemaManager')) {
+                    try {
+                        $doctrineManager = $doctrineConn->getDoctrineSchemaManager();
+                    } catch (\Throwable $_) {
+                        $doctrineManager = null;
+                    }
+                }
+            }
+        }
+
+        // 3) If still not found, try the connection's schema builder (some drivers wrap this)
+        if (!$doctrineManager) {
+            try {
+                $schemaBuilder = $connection->getSchemaBuilder();
+                if (method_exists($schemaBuilder, 'getDoctrineSchemaManager')) {
+                    $doctrineManager = $schemaBuilder->getDoctrineSchemaManager();
+                }
+            } catch (\Throwable $_) {
+                // ignore
+            }
+        }
+
+        // 4) Final fallback: attempt to create a Doctrine DBAL connection from Laravel config
+        if (!$doctrineManager) {
+            try {
+                if (class_exists('\Doctrine\DBAL\DriverManager')) {
+                    $connectionName = config('database.default');
+                    $cfg = config("database.connections.$connectionName", []);
+
+                    if (!empty($cfg) && is_array($cfg)) {
+                        $driver = $cfg['driver'] ?? null;
+
+                        $params = [
+                            'dbname' => $cfg['database'] ?? null,
+                            'user' => $cfg['username'] ?? null,
+                            'password' => $cfg['password'] ?? null,
+                            'host' => $cfg['host'] ?? null,
+                            'port' => $cfg['port'] ?? null,
+                            'charset' => $cfg['charset'] ?? null,
+                        ];
+
+                        // map common Laravel driver names to DBAL drivers
+                        if ($driver === 'mysql') {
+                            $params['driver'] = 'pdo_mysql';
+                        } elseif ($driver === 'pgsql') {
+                            $params['driver'] = 'pdo_pgsql';
+                        } elseif ($driver === 'sqlite') {
+                            $params['driver'] = 'pdo_sqlite';
+                            $params['path'] = $cfg['database'] ?? null;
+                        } elseif ($driver === 'sqlsrv') {
+                            $params['driver'] = 'pdo_sqlsrv';
+                        } else {
+                            $params['driver'] = $driver;
+                        }
+
+                        if (!empty($cfg['unix_socket'])) {
+                            $params['unix_socket'] = $cfg['unix_socket'];
+                        }
+
+                        // Use DriverManager to create a Doctrine DBAL connection
+                        $doctrineConn = \Doctrine\DBAL\DriverManager::getConnection($params);
+
+                        if (method_exists($doctrineConn, 'createSchemaManager')) {
+                            $doctrineManager = $doctrineConn->createSchemaManager();
+                        } elseif (method_exists($doctrineConn, 'getSchemaManager')) {
+                            $doctrineManager = $doctrineConn->getSchemaManager();
+                        }
+                    }
+                }
+            } catch (\Throwable $_) {
+                $doctrineManager = null;
+            }
+        }
+
+        // Finally, try to call alterTable if available on the doctrine manager
+        if ($doctrineManager && method_exists($doctrineManager, 'alterTable')) {
+            return $doctrineManager->alterTable($tableDiff);
+        }
+
+        // If we reach here, the platform doesn't support alterTable through Doctrine
+        // Provide a helpful error message guiding the user to install/enable Doctrine DBAL
+        throw new \BadMethodCallException(
+            'Unable to obtain a Doctrine SchemaManager to perform alterTable. ' .
+            'Ensure you have doctrine/dbal available and that your database connection exposes a Doctrine schema manager (getDoctrineSchemaManager / getDoctrineConnection()->getSchemaManager / createSchemaManager).'
+        );
     }
 
     public static function listTableColumnNames($tableName)
@@ -116,12 +423,49 @@ abstract class SchemaManager
             throw new \InvalidArgumentException("Column '$column' not found in table '$table'.");
         }
 
+        // FIXES:
+        // - Do not invert 'nullable' (Laravel's column info uses 'nullable' => true when NULL is allowed)
+        // - Expose length/precision/scale/unsigned/charset/collation/comment so Column::make gets these options
+
+        // Try to ensure 'length' is present by probing common fields returned by the schema builder
+        $computedLength = $columnInfo['length'] ?? null;
+
+        if ($computedLength === null) {
+            // Some schema processors (MySQL) provide type_name or type which may contain the length like "varchar(255)"
+            $typeCandidates = [];
+            if (!empty($columnInfo['type_name'])) {
+                $typeCandidates[] = $columnInfo['type_name'];
+            }
+            if (!empty($columnInfo['type'])) {
+                $typeCandidates[] = $columnInfo['type'];
+            }
+
+            foreach ($typeCandidates as $candidate) {
+                if (!is_string($candidate)) {
+                    continue;
+                }
+                if (preg_match('/\((\d+)\)/', $candidate, $m)) {
+                    $computedLength = (int) $m[1];
+                    break;
+                }
+            }
+        }
+
         return [
-            'type' => $columnType,
-            'nullable' => !($columnInfo['nullable'] ?? false),
-            'default' => $columnInfo['default'] ?? null,
-            'auto_increment' => ($columnInfo['auto_increment'] ?? false),
-        ];
+            // Prefer the DB-provided type string (which may include length like "varchar(255)")
+            // If unavailable, fall back to the normalized column type returned by the schema builder.
+            'type' => $columnInfo['type_name'] ?? $columnInfo['type'] ?? $columnType,
+             'nullable' => $columnInfo['nullable'] ?? false,
+             'default' => $columnInfo['default'] ?? null,
+             'auto_increment' => ($columnInfo['auto_increment'] ?? false),
+             'length' => $computedLength ?? ($columnInfo['precision'] ?? null),
+             'precision' => $columnInfo['precision'] ?? null,
+             'scale' => $columnInfo['scale'] ?? null,
+             'unsigned' => $columnInfo['unsigned'] ?? false,
+             'charset' => $columnInfo['charset'] ?? null,
+             'collation' => $columnInfo['collation'] ?? null,
+             'comment' => $columnInfo['comment'] ?? null,
+         ];
     }
 
     protected static function getTableIndexes($table)
@@ -134,7 +478,7 @@ abstract class SchemaManager
         $tableIndexes = static::getTableIndexes($table);
         return collect($tableIndexes)->filter(function ($index) use ($column) {
             return in_array($column, $index['columns']);
-        })->toArray();
+        });
     }
 
     protected static function getTableForeignKeys($table)
@@ -146,17 +490,143 @@ abstract class SchemaManager
     {
         $connection = Schema::getConnection();
 
-        // Check if the connection supports the getTables method
-        if (method_exists($connection->getSchemaBuilder(), 'getTables')) {
-            $tables = $connection->getSchemaBuilder()->getTables();
-            return collect($tables)->pluck('name')->values()->all();
+        // 1) Prefer schema builder getTables if available
+        try {
+            $schemaBuilder = $connection->getSchemaBuilder();
+            if (method_exists($schemaBuilder, 'getTables')) {
+                $tables = $schemaBuilder->getTables();
+                return collect($tables)->pluck('name')->values()->all();
+            }
+        } catch (\Throwable $_) {
+            // ignore and try doctrine fallbacks
         }
 
-        // Fallback method if getTables is not available
-        $tables = $connection->getDoctrineSchemaManager()->listTableNames();
+        $doctrineManager = null;
 
-        // Filter out tables that should be excluded (like migrations)
-        $excludedTables = ['migrations', 'failed_jobs', 'password_resets'];
-        return array_values(array_diff($tables, $excludedTables));
+        // 2) Try connection->getDoctrineSchemaManager()
+        try {
+            if (method_exists($connection, 'getDoctrineSchemaManager')) {
+                $doctrineManager = $connection->getDoctrineSchemaManager();
+            }
+        } catch (\Throwable $_) {
+            $doctrineManager = null;
+        }
+
+        // 3) Try underlying doctrine connection
+        if (!$doctrineManager) {
+            try {
+                if (method_exists($connection, 'getDoctrineConnection')) {
+                    $doctrineConn = $connection->getDoctrineConnection();
+                } else {
+                    $doctrineConn = null;
+                }
+            } catch (\Throwable $_) {
+                $doctrineConn = null;
+            }
+
+            if (!empty($doctrineConn)) {
+                if (method_exists($doctrineConn, 'createSchemaManager')) {
+                    try {
+                        $doctrineManager = $doctrineConn->createSchemaManager();
+                    } catch (\Throwable $_) {
+                        $doctrineManager = null;
+                    }
+                } elseif (method_exists($doctrineConn, 'getSchemaManager')) {
+                    try {
+                        $doctrineManager = $doctrineConn->getSchemaManager();
+                    } catch (\Throwable $_) {
+                        $doctrineManager = null;
+                    }
+                } elseif (method_exists($doctrineConn, 'getDoctrineSchemaManager')) {
+                    try {
+                        $doctrineManager = $doctrineConn->getDoctrineSchemaManager();
+                    } catch (\Throwable $_) {
+                        $doctrineManager = null;
+                    }
+                }
+            }
+        }
+
+        // 4) Try schema builder getDoctrineSchemaManager
+        if (!$doctrineManager) {
+            try {
+                $schemaBuilder = $connection->getSchemaBuilder();
+                if (method_exists($schemaBuilder, 'getDoctrineSchemaManager')) {
+                    $doctrineManager = $schemaBuilder->getDoctrineSchemaManager();
+                }
+            } catch (\Throwable $_) {
+                // ignore
+            }
+        }
+
+        // 5) DriverManager fallback using config
+        if (!$doctrineManager) {
+            try {
+                if (class_exists('\\Doctrine\\DBAL\\DriverManager')) {
+                    $connectionName = config('database.default');
+                    $cfg = config("database.connections.$connectionName", []);
+
+                    if (!empty($cfg) && is_array($cfg)) {
+                        $driver = $cfg['driver'] ?? null;
+
+                        $params = [
+                            'dbname' => $cfg['database'] ?? null,
+                            'user' => $cfg['username'] ?? null,
+                            'password' => $cfg['password'] ?? null,
+                            'host' => $cfg['host'] ?? null,
+                            'port' => $cfg['port'] ?? null,
+                            'charset' => $cfg['charset'] ?? null,
+                        ];
+
+                        if ($driver === 'mysql') {
+                            $params['driver'] = 'pdo_mysql';
+                        } elseif ($driver === 'pgsql') {
+                            $params['driver'] = 'pdo_pgsql';
+                        } elseif ($driver === 'sqlite') {
+                            $params['driver'] = 'pdo_sqlite';
+                            $params['path'] = $cfg['database'] ?? null;
+                        } elseif ($driver === 'sqlsrv') {
+                            $params['driver'] = 'pdo_sqlsrv';
+                        } else {
+                            $params['driver'] = $driver;
+                        }
+
+                        if (!empty($cfg['unix_socket'])) {
+                            $params['unix_socket'] = $cfg['unix_socket'];
+                        }
+
+                        $doctrineConn = \Doctrine\DBAL\DriverManager::getConnection($params);
+
+                        if (method_exists($doctrineConn, 'createSchemaManager')) {
+                            $doctrineManager = $doctrineConn->createSchemaManager();
+                        } elseif (method_exists($doctrineConn, 'getSchemaManager')) {
+                            $doctrineManager = $doctrineConn->getSchemaManager();
+                        }
+                    }
+                }
+            } catch (\Throwable $_) {
+                $doctrineManager = null;
+            }
+        }
+
+        if ($doctrineManager) {
+            try {
+                if (method_exists($doctrineManager, 'listTableNames')) {
+                    $tables = $doctrineManager->listTableNames();
+                } elseif (method_exists($doctrineManager, 'listTables')) {
+                    $tables = array_map(function ($t) { return $t->getName(); }, $doctrineManager->listTables());
+                } else {
+                    $tables = [];
+                }
+
+                // Filter out tables that should be excluded (like migrations)
+                $excludedTables = ['migrations', 'failed_jobs', 'password_resets'];
+                return array_values(array_diff($tables, $excludedTables));
+            } catch (\Throwable $_) {
+                // fall through to return empty list
+            }
+        }
+
+        return [];
     }
 }

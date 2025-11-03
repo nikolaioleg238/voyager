@@ -917,35 +917,22 @@ class VoyagerBaseController extends Controller
                 if ($search) {
                     // If we are using additional_attribute as label
                     if (in_array($options->label, $additional_attributes)) {
-                        $relationshipOptions = $model;
+                        $relationshipOptions = $model->get();
                         $relationshipOptions = $relationshipOptions->filter(function ($model) use ($search, $options) {
                             return stripos($model->{$options->label}, $search) !== false;
                         });
                         $total_count = $relationshipOptions->count();
+                        $relationshipOptions = $relationshipOptions->forPage($page, $on_page);
                     } else {
-                        $total_count = $model->where($options->label, 'LIKE', '%' . $search . '%')->count();
-                        $relationshipOptions = $model->where($options->label, 'LIKE', '%' . $search . '%');
+                        $total_count = $model->where($options->label, 'LIKE', '%'.$search.'%')->count();
+                        $relationshipOptions = $model->take($on_page)->skip($skip)
+                            ->where($options->label, 'LIKE', '%'.$search.'%')
+                            ->get();
                     }
                 } else {
                     $total_count = $model->count();
-                    $relationshipOptions = $model;
+                    $relationshipOptions = $model->take($on_page)->skip($skip)->get();
                 }
-
-                // Sort results
-                if (!empty($options->sort->field)) {
-                    $sort = SORT_REGULAR;
-                    if (!empty($options->sort->flag)) {
-                        $sort = str_replace('"', '', $options->sort->flag);
-                    }
-                    if (!empty($options->sort->direction)) {
-                        $relationshipOptions = $relationshipOptions->orderBy($options->sort->field, $options->sort->direction);
-                    }
-                }
-
-				$relationshipOptions = $relationshipOptions->get()
-				->skip($skip)
-				->take($on_page);
-
 
                 $results = [];
 
