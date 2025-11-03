@@ -6,6 +6,7 @@ use Exception;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use TCG\Voyager\Database\DatabaseUpdater;
 use TCG\Voyager\Database\Schema\Column;
@@ -331,7 +332,11 @@ class VoyagerDatabaseController extends Controller
         $this->authorize('browse_database');
 
         try {
-            SchemaManager::dropTable($table);
+            // Use Laravel's Schema builder to drop the table. Calling SchemaManager::dropTable
+            // previously delegated to DB::connection()->dropTable which does not exist
+            // on connection objects and caused the exception. Schema::dropIfExists will
+            // correctly perform the operation using the schema builder.
+            Schema::dropIfExists($table);
             event(new TableDeleted($table));
 
             return redirect()
